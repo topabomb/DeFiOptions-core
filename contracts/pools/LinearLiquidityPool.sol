@@ -1,7 +1,6 @@
 pragma solidity >=0.6.0;
 
 import "../deployment/ManagedContract.sol";
-import "../finance/OptionsExchange.sol";
 import "../finance/RedeemableToken.sol";
 import "../governance/ProtocolSettings.sol";
 import "../interfaces/TimeProvider.sol";
@@ -42,6 +41,7 @@ contract LinearLiquidityPool is LiquidityPool, ManagedContract, RedeemableToken 
 
     TimeProvider private time;
     ProtocolSettings private settings;
+    CreditProvider private creditProvider;
 
     mapping(string => PricingParameters) private parameters;
 
@@ -71,6 +71,7 @@ contract LinearLiquidityPool is LiquidityPool, ManagedContract, RedeemableToken 
         time = TimeProvider(deployer.getContractAddress("TimeProvider"));
         exchange = OptionsExchange(deployer.getContractAddress("OptionsExchange"));
         settings = ProtocolSettings(deployer.getContractAddress("ProtocolSettings"));
+        creditProvider = CreditProvider(deployer.getContractAddress("CreditProvider"));
 
         timeBase = 1e18;
         sqrtTimeBase = 1e9;
@@ -200,11 +201,13 @@ contract LinearLiquidityPool is LiquidityPool, ManagedContract, RedeemableToken 
     function depositTokens(address to, address token, uint value) override public {
 
         uint b0 = exchange.balanceOf(address(this));
-        depositTokensInExchange(msg.sender, token, value);
+        depositTokensInExchange(token, value);
         uint b1 = exchange.balanceOf(address(this));
         int po = exchange.calcExpectedPayout(address(this));
         
-        deposits.push(Deposit(time.getNow().toUint32(), uint(int(b0).add(po)), value));
+        deposits.push(
+            Deposit(time.getNow().toUint32(), uint(int(b0).add(po)), b1.sub(b0))
+        );
 
         uint ts = _totalSupply;
         int expBal = po.add(int(b1));
@@ -224,9 +227,9 @@ contract LinearLiquidityPool is LiquidityPool, ManagedContract, RedeemableToken 
     function calcFreeBalance() public view returns (uint balance) {
 
         uint exBal = exchange.balanceOf(address(this));
-        balance = exBal.mul(reserveRatio).div(fractionBase);
+        uint reserve = exBal.mul(reserveRatio).div(fractionBase);
         uint sp = exBal.sub(exchange.collateral(address(this)));
-        balance = sp > balance ? sp.sub(balance) : 0;
+        balance = sp > reserve ? sp.sub(reserve) : 0;
     }
     
     function listSymbols() override external view returns (string memory available) {
@@ -242,12 +245,6 @@ contract LinearLiquidityPool is LiquidityPool, ManagedContract, RedeemableToken 
         }
     }
 
-    function setUpSymbol(string calldata optSymbol) external {
-
-        PricingParameters memory param = parameters[optSymbol];
-        writeOptions(optSymbol, param, 1, address(this));
-    }
-
     function queryBuy(string memory optSymbol)
         override
         public
@@ -257,10 +254,10 @@ contract LinearLiquidityPool is LiquidityPool, ManagedContract, RedeemableToken 
         ensureValidSymbol(optSymbol);
         PricingParameters memory param = parameters[optSymbol];
         price = calcOptPrice(param, Operation.BUY);
-        uint _written = exchange.writtenVolume(optSymbol, address(this));
+        address _tk = exchange.resolveToken(optSymbol);
         volume = MoreMath.min(
-            calcVolume(param, price, Operation.BUY),
-            uint(param.buyStock).sub(_written)
+            calcVolume(optSymbol, param, price, Operation.BUY),
+            uint(param.buyStock).sub(OptionToken(_tk).writtenVolume(address(this)))
         );
     }
 
@@ -273,10 +270,10 @@ contract LinearLiquidityPool is LiquidityPool, ManagedContract, RedeemableToken 
         ensureValidSymbol(optSymbol);
         PricingParameters memory param = parameters[optSymbol];
         price = calcOptPrice(param, Operation.SELL);
-        address tk = exchange.resolveToken(optSymbol);
+        address _tk = exchange.resolveToken(optSymbol);
         volume = MoreMath.min(
-            calcVolume(param, price, Operation.SELL),
-            uint(param.sellStock).sub(ERC20(tk).balanceOf(address(this)))
+            calcVolume(optSymbol, param, price, Operation.SELL),
+            uint(param.sellStock).sub(OptionToken(_tk).balanceOf(address(this)))
         );
     }
     
@@ -285,6 +282,7 @@ contract LinearLiquidityPool is LiquidityPool, ManagedContract, RedeemableToken 
         uint price,
         uint volume,
         address token,
+        uint maxValue,
         uint deadline,
         uint8 v,
         bytes32 r,
@@ -292,68 +290,90 @@ contract LinearLiquidityPool is LiquidityPool, ManagedContract, RedeemableToken 
     )
         override
         public
-        returns (address tk)
+        returns (address _tk)
     {
         require(volume > 0, "invalid volume");
         ensureValidSymbol(optSymbol);
 
         PricingParameters memory param = parameters[optSymbol];
-        price = receivePayment(param, price, volume, token, deadline, v, r, s);
+        price = receivePayment(param, price, volume, maxValue, token, deadline, v, r, s);
 
-        tk = exchange.resolveToken(optSymbol);
-        uint _holding = ERC20(tk).balanceOf(address(this));
+        _tk = exchange.resolveToken(optSymbol);
+        OptionToken tk = OptionToken(_tk);
+        uint _holding = tk.balanceOf(address(this));
+
         if (volume > _holding) {
-            writeOptions(optSymbol, param, volume, msg.sender);
+            writeOptions(tk, param, volume, msg.sender);
         } else {
-            OptionToken(tk).transfer(msg.sender, volume);
+            tk.transfer(msg.sender, volume);
         }
 
-        emit Buy(tk, msg.sender, price, volume);
+        emit Buy(_tk, msg.sender, price, volume);
     }
 
     function buy(string calldata optSymbol, uint price, uint volume, address token)
         override
         external
-        returns (address tk)
+        returns (address _tk)
     {
         bytes32 x;
-        tk = buy(optSymbol, price, volume, token, 0, 0, x, x);
+        uint maxValue = price.mul(volume).div(volumeBase);
+        _tk = buy(optSymbol, price, volume, token, maxValue, 0, 0, x, x);
     }
 
-    function sell(string calldata optSymbol, uint price, uint volume) override external {
-        
+    function sell(
+        string memory optSymbol,
+        uint price,
+        uint volume,
+        uint deadline,
+        uint8 v,
+        bytes32 r,
+        bytes32 s
+    )
+        override
+        public
+    {
         require(volume > 0, "invalid volume");
         ensureValidSymbol(optSymbol);
 
         PricingParameters memory param = parameters[optSymbol];
         price = validatePrice(price, param, Operation.SELL);
 
-        address addr = exchange.resolveToken(optSymbol);
-        OptionToken tk = OptionToken(addr);
+        address _tk = exchange.resolveToken(optSymbol);
+        OptionToken tk = OptionToken(_tk);
+        if (deadline > 0) {
+            tk.permit(msg.sender, address(this), volume, deadline, v, r, s);
+        }
         tk.transferFrom(msg.sender, address(this), volume);
-
-        uint value = price.mul(volume).div(volumeBase);
-        exchange.transferBalance(msg.sender, value);
         
-        require(calcFreeBalance() > 0, "excessive volume");
-        
-        uint _written = exchange.writtenVolume(optSymbol, address(this));
-
+        uint _written = tk.writtenVolume(address(this));
         if (_written > 0) {
             uint toBurn = MoreMath.min(_written, volume);
             tk.burn(toBurn);
         }
 
+        uint value = price.mul(volume).div(volumeBase);
+        exchange.transferBalance(msg.sender, value);
+        
+        require(calcFreeBalance() > 0, "pool balance too low");
+
         uint _holding = tk.balanceOf(address(this));
         require(_holding <= param.sellStock, "excessive volume");
 
-        emit Sell(addr, msg.sender, price, volume);
+        emit Sell(_tk, msg.sender, price, volume);
+    }
+
+    function sell(string calldata optSymbol, uint price, uint volume) override external {
+        
+        bytes32 x;
+        sell(optSymbol, price, volume, 0, 0, x, x);
     }
 
     function receivePayment(
         PricingParameters memory param,
         uint price,
         uint volume,
+        uint maxValue,
         address token,
         uint deadline,
         uint8 v,
@@ -363,18 +383,16 @@ contract LinearLiquidityPool is LiquidityPool, ManagedContract, RedeemableToken 
         private
         returns (uint)
     {
-        uint maxValue = price.mul(volume).div(volumeBase);
         price = validatePrice(price, param, Operation.BUY);
         uint value = price.mul(volume).div(volumeBase);
 
         if (token != address(exchange)) {
             (uint tv, uint tb) = settings.getTokenRate(token);
             if (deadline > 0) {
-                maxValue = maxValue.mul(tv).div(tb);
                 ERC20(token).permit(msg.sender, address(this), maxValue, deadline, v, r, s);
             }
             value = value.mul(tv).div(tb);
-            depositTokensInExchange(msg.sender, token, value);
+            depositTokensInExchange(token, value);
         } else {
             exchange.transferBalance(msg.sender, address(this), value, maxValue, deadline, v, r, s);
         }
@@ -399,14 +417,14 @@ contract LinearLiquidityPool is LiquidityPool, ManagedContract, RedeemableToken 
     }
 
     function writeOptions(
-        string memory optSymbol,
+        OptionToken tk,
         PricingParameters memory param,
         uint volume,
         address to
     )
         private
     {
-        uint _written = exchange.writtenVolume(optSymbol, address(this));
+        uint _written = tk.writtenVolume(address(this));
         require(_written.add(volume) <= param.buyStock, "excessive volume");
 
         exchange.writeOptions(
@@ -418,7 +436,7 @@ contract LinearLiquidityPool is LiquidityPool, ManagedContract, RedeemableToken 
             to
         );
         
-        require(calcFreeBalance() > 0, "excessive volume");
+        require(calcFreeBalance() > 0, "pool balance too low");
     }
 
     function calcOptPrice(PricingParameters memory p, Operation op)
@@ -478,6 +496,7 @@ contract LinearLiquidityPool is LiquidityPool, ManagedContract, RedeemableToken 
     }
 
     function calcVolume(
+        string memory optSymbol,
         PricingParameters memory p,
         uint price,
         Operation op
@@ -487,21 +506,34 @@ contract LinearLiquidityPool is LiquidityPool, ManagedContract, RedeemableToken 
         returns (uint volume)
     {
         uint fb = calcFreeBalance();
+        uint r = fractionBase.sub(reserveRatio);
+
+        uint coll = exchange.calcCollateral(
+            p.udlFeed,
+            volumeBase,
+            p.optType,
+            p.strike,
+            p.maturity
+        );
 
         if (op == Operation.BUY) {
 
-            uint coll = exchange.calcCollateral(
-                p.udlFeed,
-                volumeBase,
-                p.optType,
-                p.strike,
-                p.maturity
-            );
-
             volume = coll <= price ? uint(-1) :
-                fb.mul(volumeBase).div(coll.sub(price));
+                fb.mul(volumeBase).div(
+                    coll.sub(price.mul(r).div(fractionBase))
+                );
 
         } else {
+
+            uint bal = exchange.balanceOf(address(this));
+
+            uint poolColl = exchange.collateral(address(this));
+
+            uint writtenColl = OptionToken(
+                exchange.resolveToken(optSymbol)
+            ).writtenVolume(address(this)).mul(coll);
+
+            poolColl = poolColl > writtenColl ? poolColl.sub(writtenColl) : 0;
             
             uint iv = uint(exchange.calcIntrinsicValue(
                 p.udlFeed,
@@ -511,11 +543,18 @@ contract LinearLiquidityPool is LiquidityPool, ManagedContract, RedeemableToken 
             ));
 
             volume = price <= iv ? uint(-1) :
-                fb.mul(volumeBase).div(price.sub(iv));
+                bal.sub(poolColl.mul(fractionBase).div(r)).mul(volumeBase).div(
+                    price.sub(iv)
+                );
+
+            volume = MoreMath.max(
+                volume, 
+                bal.mul(volumeBase).div(price)
+            );
 
             volume = MoreMath.min(
                 volume, 
-                exchange.balanceOf(address(this)).mul(volumeBase).div(price)
+                bal.mul(volumeBase).div(price)
             );
         }
     }
@@ -541,12 +580,11 @@ contract LinearLiquidityPool is LiquidityPool, ManagedContract, RedeemableToken 
         }
     }
 
-    function depositTokensInExchange(address sender, address token, uint value) private {
+    function depositTokensInExchange(address token, uint value) private {
         
         ERC20 t = ERC20(token);
-        t.transferFrom(sender, address(this), value);
-        t.approve(address(exchange), value);
-        exchange.depositTokens(address(this), token, value);
+        t.transferFrom(msg.sender, address(creditProvider), value);
+        creditProvider.addBalance(address(this), token, value);
     }
 
     function ensureValidSymbol(string memory optSymbol) private view {
