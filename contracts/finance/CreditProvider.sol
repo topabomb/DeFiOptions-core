@@ -25,8 +25,13 @@ contract CreditProvider is ManagedContract {
     mapping(address => uint) private callers;
 
     address private ctAddr;
-    uint private _totalTokenStock;
     uint private _totalAccruedFees;
+
+    event TransferBalance(address indexed from, address indexed to, uint value);
+
+    event AccumulateDebt(address indexed to, uint value);
+
+    event BurnDebt(address indexed from, uint value);
 
     constructor(address deployer) public {
 
@@ -43,13 +48,17 @@ contract CreditProvider is ManagedContract {
         callers[address(settings)] = 1;
         callers[deployer.getContractAddress("CreditToken")] = 1;
         callers[deployer.getContractAddress("OptionsExchange")] = 1;
+        callers[deployer.getContractAddress("LinearLiquidityPool")] = 1;
 
         ctAddr = address(creditToken);
     }
 
-    function totalTokenStock() external view returns (uint) {
+    function totalTokenStock() external view returns (uint v) {
 
-        return _totalTokenStock;
+        address[] memory tokens = settings.getAllowedTokens();
+        for (uint i = 0; i < tokens.length; i++) {
+            v = v.add(ERC20(tokens[i]).balanceOf(address(this)));
+        }
     }
 
     function totalAccruedFees() external view returns (uint) {
@@ -69,25 +78,24 @@ contract CreditProvider is ManagedContract {
 
         return balances[owner];
     }
+    
+    function addBalance(address to, address token, uint value) external {
+
+        addBalance(to, token, value, false);
+    }
 
     function transferBalance(address from, address to, uint value) public {
 
         ensureCaller();
         removeBalance(from, value);
         addBalance(to, value);
+        emit TransferBalance(from, to, value);
     }
     
     function depositTokens(address to, address token, uint value) external {
 
-        if (value > 0) {
-            
-            (uint r, uint b) = settings.getTokenRate(token);
-            require(r != 0 && token != ctAddr, "token not allowed");
-            ERC20(token).transferFrom(msg.sender, address(this), value);
-            value = value.mul(b).div(r);
-            addBalance(to, value);
-            _totalTokenStock = _totalTokenStock.add(value);
-        }
+        ERC20(token).transferFrom(msg.sender, address(this), value);
+        addBalance(to, token, value, true);
     }
 
     function withdrawTokens(address owner, uint value) external {
@@ -138,11 +146,28 @@ contract CreditProvider is ManagedContract {
                 applyDebtInterestRate(from);
                 setDebt(from, debts[from].add(credit));
                 addBalance(to, credit);
+                emit AccumulateDebt(to, value);
             }
         }
     }
     
-    function addBalance(address owner, uint value) public {
+    function addBalance(address to, address token, uint value, bool trusted) private {
+
+        if (value > 0) {
+
+            if (!trusted) {
+                ensureCaller();
+            }
+            
+            (uint r, uint b) = settings.getTokenRate(token);
+            require(r != 0 && token != ctAddr, "token not allowed");
+            value = value.mul(b).div(r);
+            addBalance(to, value);
+            emit TransferBalance(address(0), to, value);
+        }
+    }
+    
+    function addBalance(address owner, uint value) private {
 
         if (value > 0) {
 
@@ -174,6 +199,7 @@ contract CreditProvider is ManagedContract {
         if (d > 0) {
             burnt = MoreMath.min(value, d);
             setDebt(from, d.sub(burnt));
+            emit BurnDebt(from, value);
         }
     }
 
@@ -207,7 +233,6 @@ contract CreditProvider is ManagedContract {
             if (b != 0) {
                 uint v = MoreMath.min(value, t.balanceOf(address(this)).mul(b).div(r));
                 t.transfer(to, v.mul(r).div(b));
-                _totalTokenStock = _totalTokenStock.sub(v);
                 value = value.sub(v);
             }
         }

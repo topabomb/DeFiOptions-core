@@ -11,14 +11,16 @@ contract PoolTrader {
     LiquidityPool private pool;
     
     address private addr;
+    address private feed;
     uint private volumeBase = 1e18;
     
-    constructor(address _erc20, address _exchange, address _pool) public {
+    constructor(address _erc20, address _exchange, address _pool, address _feed) public {
 
         erc20 = ERC20(_erc20);
         exchange = OptionsExchange(_exchange);
         pool = LiquidityPool(_pool);
         addr = address(this);
+        feed = _feed;
     }
     
     function balance() external view returns (uint) {
@@ -44,10 +46,10 @@ contract PoolTrader {
         uint maturity
     )
         public
-        returns (uint id)
+        returns (address _tk)
     {
-        id = exchange.writeOptions(
-            address(0), volume * volumeBase, optType, strike, maturity
+        (_tk) = exchange.writeOptions(
+            feed, volume * volumeBase, optType, strike, maturity, address(this)
         );
     }
     

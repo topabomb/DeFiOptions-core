@@ -23,21 +23,16 @@ contract OptionsExchange is ManagedContract {
     
     enum OptionType { CALL, PUT }
     
-    struct OrderData {
-        uint64 id;
-        OptionData option;
-        address owner;
-        address udlFeed;
-        uint120 lowerVol;
-        uint120 upperVol;
-        uint120 written;
-        uint120 holding;
-    }
-    
     struct OptionData {
+        address udlFeed;
         OptionType _type;
         uint120 strike;
         uint32 maturity;
+    }
+
+    struct FeedData {
+        uint120 lowerVol;
+        uint120 upperVol;
     }
     
     TimeProvider private time;
@@ -45,28 +40,43 @@ contract OptionsExchange is ManagedContract {
     CreditProvider private creditProvider;
     OptionTokenFactory private factory;
 
-    mapping(uint => OrderData) private orders;
-    mapping(address => uint64[]) private book;
-    mapping(address => mapping(string => uint64)) private index;
-
+    mapping(address => uint) public collateral;
+    mapping(address => OptionData) private options;
+    mapping(address => FeedData) private feeds;
+    mapping(address => address[]) private book;
     mapping(string => address) private tokenAddress;
-    mapping(string => uint64[]) private tokenIds;
+    mapping(address => uint) public nonces;
     
-    uint64 private serial;
-    uint private volumeBase;
+    uint public volumeBase;
     uint private timeBase;
     uint private sqrtTimeBase;
 
-    mapping(address => uint) public nonces;
     bytes32 public DOMAIN_SEPARATOR;
     // keccak256("Permit(address owner,address spender,uint256 value,uint256 nonce,uint256 deadline)");
     bytes32 public constant PERMIT_TYPEHASH = 0x6e71edae12b1b97f4d1f60370fef10105fa2faae0126114a169c64845d6126c9;
 
-    event CreateSymbol(string indexed symbol);
+    event CreateSymbol(address indexed token, address indexed sender);
 
-    event WriteOptions(string indexed symbol, address indexed issuer, uint volume, uint id);
+    event WriteOptions(
+        address indexed token,
+        address indexed issuer,
+        address indexed onwer,
+        uint volume
+    );
 
-    event LiquidateSymbol(string indexed symbol, int udlPrice, uint value);
+    event LiquidateEarly(
+        address indexed token,
+        address indexed sender,
+        address indexed onwer,
+        uint volume
+    );
+
+    event LiquidateExpired(
+        address indexed token,
+        address indexed sender,
+        address indexed onwer,
+        uint volume
+    );
 
     constructor(address deployer) public {
 
@@ -95,7 +105,6 @@ contract OptionsExchange is ManagedContract {
         settings = ProtocolSettings(deployer.getContractAddress("ProtocolSettings"));
         factory = OptionTokenFactory(deployer.getContractAddress("OptionTokenFactory"));
 
-        serial = 1;
         volumeBase = 1e18;
         timeBase = 1e18;
         sqrtTimeBase = 1e9;
@@ -119,9 +128,8 @@ contract OptionsExchange is ManagedContract {
     function depositTokens(address to, address token, uint value) public {
 
         ERC20 t = ERC20(token);
-        t.transferFrom(msg.sender, address(this), value);
-        t.approve(address(creditProvider), value);
-        creditProvider.depositTokens(to, token, value);
+        t.transferFrom(msg.sender, address(creditProvider), value);
+        creditProvider.addBalance(to, token, value);
     }
 
     function balanceOf(address owner) external view returns (uint) {
@@ -141,7 +149,7 @@ contract OptionsExchange is ManagedContract {
     )
         external
     {
-        require(maxValue > value, "insufficient permit value");
+        require(maxValue >= value, "insufficient permit value");
         permit(from, to, maxValue, deadline, v, r, s);
         creditProvider.transferBalance(from, to, value);
         ensureFunds(from);
@@ -159,143 +167,89 @@ contract OptionsExchange is ManagedContract {
         creditProvider.withdrawTokens(msg.sender, value);
     }
 
+    function createSymbol(string memory symbol, address udlFeed) public returns (address tk) {
+
+        require(tokenAddress[symbol] == address(0), "already created");
+        tk = factory.create(symbol, udlFeed);
+        tokenAddress[symbol] = tk;
+        prefetchFeedData(udlFeed);
+        emit CreateSymbol(tk, msg.sender);
+    }
+
     function writeOptions(
         address udlFeed,
         uint volume,
         OptionType optType,
         uint strike, 
-        uint maturity
+        uint maturity,
+        address to
     )
         external 
-        returns (uint id)
+        returns (address _tk)
     {
-        id = createOrder(udlFeed, volume, optType, strike, maturity);
+        (_tk) = writeOptionsInternal(udlFeed, volume, optType, strike, maturity, to);
         ensureFunds(msg.sender);
     }
-
-    function writtenVolume(string calldata symbol, address owner) external view returns (uint) {
-
-        return uint(findOrder(owner, symbol).written);
-    }
-
+    
     function transferOwnership(
         string calldata symbol,
         address from,
         address to,
-        uint volume
+        uint value
     )
         external
     {
         require(tokenAddress[symbol] == msg.sender, "unauthorized ownership transfer");
-
-        OrderData memory ord = findOrder(from, symbol);
-
-        require(isValid(ord), "order not found");
-        require(volume <= ord.holding, "invalid volume");
-                
-        OrderData memory toOrd = findOrder(to, symbol);
-
-        if (!isValid(toOrd)) {
-            toOrd = orders[ord.id];
-            toOrd.id = serial++;
-            toOrd.owner = address(to);
-            toOrd.written = 0;
-            toOrd.holding = volume.toUint120();
-            orders[toOrd.id] = toOrd;
-            book[to].push(toOrd.id);
-            index[to][symbol] = toOrd.id;
-            tokenIds[symbol].push(toOrd.id);
-        } else {
-            orders[toOrd.id].holding = uint(orders[toOrd.id].holding).add(volume).toUint120();
-        }
         
-        orders[ord.id].holding = uint(orders[ord.id].holding).sub(volume).toUint120();
+        OptionToken tk = OptionToken(msg.sender);
+        
+        if (tk.writtenVolume(from) == 0 && tk.balanceOf(from) == 0) {
+            Arrays.removeItem(book[from], msg.sender);
+        }
 
-        ensureFunds(ord.owner);
+        if (tk.writtenVolume(to) == 0 && tk.balanceOf(to) == value) {
+            book[to].push(msg.sender);
+        }
 
-        if (shouldRemove(ord.id)) {
-            removeOrder(symbol, ord.id);
+        ensureFunds(from);
+    }
+
+    function cleanUp(address _tk, address owner, uint volume) public {
+
+        OptionToken tk = OptionToken(_tk);
+        if (tk.balanceOf(owner) == 0 && tk.writtenVolume(owner) == 0) {
+            Arrays.removeItem(book[owner], _tk);
+        }
+        uint coll = collateral[owner];
+        collateral[owner] = coll.sub(
+            MoreMath.min(coll, calcCollateral(options[_tk], volume))
+        );
+    }
+
+    function liquidateExpired(address _tk, address[] calldata owners) external {
+
+        OptionData memory opt = options[_tk];
+        OptionToken tk = OptionToken(_tk);
+        require(getUdlNow(opt) >= opt.maturity, "option not expired");
+        uint iv = uint(calcIntrinsicValue(opt));
+
+        for (uint i = 0; i < owners.length; i++) {
+            liquidateOptions(owners[i], opt, tk, true, iv);
         }
     }
 
-    function burnOptions(
-        string calldata symbol,
-        address owner,
-        uint volume
-    )
-        external
-    {
-        require(tokenAddress[symbol] == msg.sender, "unauthorized burn");
+    function liquidateOptions(address _tk, address owner) public returns (uint value) {
         
-        OrderData memory ord = findOrder(owner, symbol);
+        OptionData memory opt = options[_tk];
+        require(opt.udlFeed != address(0), "invalid token");
+
+        OptionToken tk = OptionToken(_tk);
+        require(tk.writtenVolume(owner) > 0, "invalid owner");
+
+        bool isExpired = getUdlNow(opt) >= opt.maturity;
+        uint iv = uint(calcIntrinsicValue(opt));
         
-        require(isValid(ord), "order not found");
-        require(ord.written >= volume && ord.holding >= volume, "invalid volume");
-        
-        orders[ord.id].written = uint(ord.written).sub(volume).toUint120();
-        orders[ord.id].holding = uint(ord.holding).sub(volume).toUint120();
-
-        if (shouldRemove(ord.id)) {
-            removeOrder(symbol, ord.id);
-        }
-    }
-
-    function liquidateSymbol(string calldata symbol, uint limit) external {
-
-        uint value;
-        int udlPrice;
-        uint iv;
-        uint len = tokenIds[symbol].length;
-        OrderData memory ord;
-
-        if (len > 0) {
-
-            for (uint i = 0; i < len && i < limit; i++) {
-                
-                uint64 id = tokenIds[symbol][0];
-                ord = orders[id];
-
-                if (i == 0) {
-                    udlPrice = getUdlPrice(ord);
-                    uint _now = getUdlNow(ord);
-                    iv = uint(calcIntrinsicValue(ord));
-                    require(ord.option.maturity <= _now, "maturity not reached");
-                }
-
-                require(ord.id == id, "invalid order id");
-
-                if (ord.written > 0) {
-                    value.add(
-                        liquidateAfterMaturity(ord, symbol, msg.sender, iv.mul(ord.written))
-                    );
-                } else {
-                    removeOrder(symbol, id);
-                }
-            }
-        }
-
-        if (len <= limit) {
-            delete tokenIds[symbol];
-            delete tokenAddress[symbol];
-        }
-
-        emit LiquidateSymbol(symbol, udlPrice, value);
-    }
-
-    function liquidateOptions(uint id) external returns (uint value) {
-        
-        OrderData memory ord = orders[id];
-        require(ord.id == id && ord.written > 0, "invalid order id");
-
-        address token = resolveToken(id);
-        string memory symbol = OptionToken(token).symbol();
-        uint iv = uint(calcIntrinsicValue(ord)).mul(ord.written);
-        
-        if (getUdlNow(ord) >= ord.option.maturity) {
-            value = liquidateAfterMaturity(ord, symbol, token, iv);
-        } else {
-            value = liquidateBeforeMaturity(ord, symbol, token, iv);
-        }
+        value = liquidateOptions(owner, opt, tk, isExpired, iv);
     }
 
     function calcDebt(address owner) external view returns (uint debt) {
@@ -305,12 +259,45 @@ contract OptionsExchange is ManagedContract {
     
     function calcSurplus(address owner) public view returns (uint) {
         
-        uint collateral = calcCollateral(owner);
+        uint coll = calcCollateral(owner);
         uint bal = creditProvider.balanceOf(owner);
-        if (bal >= collateral) {
-            return bal.sub(collateral);
+        if (bal >= coll) {
+            return bal.sub(coll);
         }
         return 0;
+    }
+
+    function setCollateral(address owner) external {
+
+        collateral[owner] = calcCollateral(owner);
+    }
+    
+    function calcCollateral(address owner) public view returns (uint) {
+        
+        int coll;
+        address[] memory _book = book[owner];
+
+        for (uint i = 0; i < _book.length; i++) {
+
+            address _tk = _book[i];
+            OptionToken tk = OptionToken(_tk);
+            OptionData memory opt = options[_tk];
+
+            uint written = tk.writtenVolume(owner);
+            uint holding = tk.balanceOf(owner);
+
+            coll = coll.add(
+                calcIntrinsicValue(opt).mul(
+                    int(written).sub(int(holding))
+                )
+            ).add(int(calcCollateral(feeds[opt.udlFeed].upperVol, written, opt)));
+        }
+
+        coll = coll.div(int(volumeBase));
+
+        if (coll < 0)
+            return 0;
+        return uint(coll);
     }
 
     function calcCollateral(
@@ -320,137 +307,39 @@ contract OptionsExchange is ManagedContract {
         uint strike, 
         uint maturity
     )
-        external
+        public
         view
         returns (uint)
     {
-        OrderData memory ord = createOrderInMemory(udlFeed, volume, optType, strike, maturity);
-
-        int collateral = calcIntrinsicValue(ord).mul(int(volume)).add(
-            int(calcCollateral(ord.upperVol, ord))
-        ).div(int(volumeBase));
-
-        return collateral > 0 ? uint(collateral) : 0;
-    }
-    
-    function calcCollateral(address owner) public view returns (uint) {
-        
-        int collateral;
-        uint64[] memory ids = book[owner];
-
-        for (uint i = 0; i < ids.length; i++) {
-
-            OrderData memory ord = orders[ids[i]];
-
-            if (isValid(ord)) {
-                collateral = collateral.add(
-                    calcIntrinsicValue(ord).mul(
-                        int(ord.written).sub(int(ord.holding))
-                    )
-                ).add(int(calcCollateral(ord.upperVol, ord)));
-            }
-        }
-
-        collateral = collateral.div(int(volumeBase));
-
-        if (collateral < 0)
-            return 0;
-        return uint(collateral);
+        (OptionData memory opt,) = createOptionInMemory(udlFeed, optType, strike, maturity);
+        return calcCollateral(opt, volume);
     }
 
     function calcExpectedPayout(address owner) external view returns (int payout) {
 
-        uint64[] memory ids = book[owner];
+        address[] memory _book = book[owner];
 
-        for (uint i = 0; i < ids.length; i++) {
+        for (uint i = 0; i < _book.length; i++) {
 
-            OrderData memory ord = orders[ids[i]];
+            OptionToken tk = OptionToken(_book[i]);
+            OptionData memory opt = options[_book[i]];
 
-            if (isValid(ord)) {
-                payout = payout.add(
-                    calcIntrinsicValue(ord).mul(
-                        int(ord.holding).sub(int(ord.written))
-                    )
-                );
-            }
+            uint written = tk.writtenVolume(owner);
+            uint holding = tk.balanceOf(owner);
+
+            payout = payout.add(
+                calcIntrinsicValue(opt).mul(
+                    int(holding).sub(int(written))
+                )
+            );
         }
 
         payout = payout.div(int(volumeBase));
     }
-
-    function resolveSymbol(uint id) external view returns (string memory) {
-        
-        return getOptionSymbol(orders[id]);
-    }
-
-    function resolveToken(uint id) public view returns (address) {
-        
-        address addr = tokenAddress[getOptionSymbol(orders[id])];
-        require(addr != address(0), "token not found");
-        return addr;
-    }
-
-    function resolveToken(string memory symbol) public view returns (address) {
-        
-        address addr = tokenAddress[symbol];
-        require(addr != address(0), "token not found");
-        return addr;
-    }
-
-    function getBook(address owner)
-        external view
-        returns (
-            string memory symbols,
-            uint[] memory holding,
-            uint[] memory written,
-            int[] memory iv
-        )
-    {
-        uint64[] memory ids = book[owner];
-        holding = new uint[](ids.length);
-        written = new uint[](ids.length);
-        iv = new int[](ids.length);
-
-        for (uint i = 0; i < ids.length; i++) {
-            OrderData memory ord = orders[ids[i]];
-            if (i == 0) {
-                symbols = getOptionSymbol(ord);
-            } else {
-                symbols = string(abi.encodePacked(symbols, "\n", getOptionSymbol(ord)));
-            }
-            holding[i] = ord.holding;
-            written[i] = ord.written;
-            iv[i] = calcIntrinsicValue(ord);
-        }
-    }
-
-    function getBookLength() external view returns (uint len) {
-        
-        for (uint i = 0; i < serial; i++) {
-            if (isValid(orders[i])) {
-                len++;
-            }
-        }
-    }
-
-    function getVolumeBase() external view returns (uint) {
-        
-        return volumeBase;
-    }
     
-    function calcLowerCollateral(uint id) external view returns (uint) {
+    function calcIntrinsicValue(address _tk) external view returns (int) {
         
-        return calcCollateral(orders[id].lowerVol, orders[id]).div(volumeBase);
-    }
-    
-    function calcUpperCollateral(uint id) external view returns (uint) {
-        
-        return calcCollateral(orders[id].upperVol, orders[id]).div(volumeBase);
-    }
-    
-    function calcIntrinsicValue(uint id) external view returns (int) {
-        
-        return calcIntrinsicValue(orders[id]);
+        return calcIntrinsicValue(options[_tk]);
     }
 
     function calcIntrinsicValue(
@@ -463,9 +352,57 @@ contract OptionsExchange is ManagedContract {
         view
         returns (int)
     {
-        OrderData memory ord = createOrderInMemory(udlFeed, volumeBase, optType, strike, maturity);
+        (OptionData memory opt,) = createOptionInMemory(udlFeed, optType, strike, maturity);
+        return calcIntrinsicValue(opt);
+    }
 
-        return calcIntrinsicValue(ord);
+    function resolveToken(string memory symbol) public view returns (address) {
+        
+        address addr = tokenAddress[symbol];
+        require(addr != address(0), "token not found");
+        return addr;
+    }
+
+    function prefetchFeedData(address udlFeed) public {
+        
+        feeds[udlFeed] = getFeedData(udlFeed);
+    }
+
+    function getBook(address owner)
+        external view
+        returns (
+            string memory symbols,
+            address[] memory tokens,
+            uint[] memory holding,
+            uint[] memory written,
+            int[] memory iv
+        )
+    {
+        tokens = book[owner];
+        holding = new uint[](tokens.length);
+        written = new uint[](tokens.length);
+        iv = new int[](tokens.length);
+
+        for (uint i = 0; i < tokens.length; i++) {
+            OptionToken tk = OptionToken(tokens[i]);
+            OptionData memory opt = options[tokens[i]];
+            if (i == 0) {
+                symbols = getOptionSymbol(opt);
+            } else {
+                symbols = string(abi.encodePacked(symbols, "\n", getOptionSymbol(opt)));
+            }
+            holding[i] = tk.balanceOf(owner);
+            written[i] = tk.writtenVolume(owner);
+            iv[i] = calcIntrinsicValue(opt);
+        }
+    }
+
+    function ensureFunds(address owner) private view {
+        
+        require(
+            creditProvider.balanceOf(owner) >= collateral[owner],
+            "insufficient collateral"
+        );
     }
 
     function permit(
@@ -493,97 +430,89 @@ contract OptionsExchange is ManagedContract {
         require(recoveredAddress != address(0) && recoveredAddress == from, "invalid signature");
     }
 
-    function createOrder(
+    function writeOptionsInternal(
         address udlFeed,
         uint volume,
         OptionType optType,
         uint strike, 
-        uint maturity
+        uint maturity,
+        address to
     )
         private 
-        returns (uint id)
+        returns (address _tk)
     {
-        require(udlFeed == address(0) || settings.getUdlFeed(udlFeed) > 0, "feed not allowed");
+        require(settings.getUdlFeed(udlFeed) > 0, "feed not allowed");
         require(volume > 0, "invalid volume");
         require(maturity > time.getNow(), "invalid maturity");
 
-        OrderData memory ord = createOrderInMemory(udlFeed, volume, optType, strike, maturity);
-        string memory symbol = getOptionSymbol(ord);
+        (OptionData memory opt, string memory symbol) =
+            createOptionInMemory(udlFeed, optType, strike, maturity);
 
-        OrderData memory result = findOrder(msg.sender, symbol);
-        if (isValid(result)) {
-            id = result.id;
-            orders[id].written = uint(result.written).add(volume).toUint120();
-            orders[id].holding = uint(result.holding).add(volume).toUint120();
-        } else {
-            id = serial++;
-            ord.id = uint64(id);
-            orders[id] = ord;
-            book[msg.sender].push(ord.id);
-            index[msg.sender][symbol] = ord.id;
-            tokenIds[symbol].push(ord.id);
+        _tk = tokenAddress[symbol];
+        if (_tk == address(0)) {
+            _tk = createSymbol(symbol, udlFeed);
         }
 
-        address tk = tokenAddress[symbol];
-        if (tk == address(0)) {
-            tk = factory.create(symbol);
-            tokenAddress[symbol] = tk;
-            emit CreateSymbol(symbol);
+        OptionToken tk = OptionToken(_tk);
+        if (tk.writtenVolume(msg.sender) == 0 && tk.balanceOf(msg.sender) == 0) {
+            book[msg.sender].push(_tk);
+        }
+        if (msg.sender != to && tk.writtenVolume(to) == 0 && tk.balanceOf(to) == 0) {
+            book[to].push(_tk);
+        }
+        tk.issue(msg.sender, to, volume);
+
+        if (options[_tk].udlFeed == address(0)) {
+            options[_tk] = opt;
         }
         
-        OptionToken(tk).issue(msg.sender, volume);
-        emit WriteOptions(symbol, msg.sender, volume, id);
+        collateral[msg.sender] = collateral[msg.sender].add(
+            calcCollateral(opt, volume)
+        );
+
+        emit WriteOptions(_tk, msg.sender, to, volume);
     }
 
-    function createOrderInMemory(
+    function createOptionInMemory(
         address udlFeed,
-        uint volume,
         OptionType optType,
         uint strike, 
         uint maturity
     )
         private
         view
-        returns (OrderData memory ord)
+        returns (OptionData memory opt, string memory symbol)
     {
-        OptionData memory opt = OptionData(optType, strike.toUint120(), maturity.toUint32());
-
-        UnderlyingFeed feed = udlFeed != address(0) ?
-            UnderlyingFeed(udlFeed) :
-            UnderlyingFeed(settings.getDefaultUdlFeed());
-
-        uint vol = feed.getDailyVolatility(settings.getVolatilityPeriod());
-
-        ord = OrderData(
-            0,
-            opt,
-            msg.sender, 
-            address(feed),
-            feed.calcLowerVolatility(uint(vol)).toUint120(),
-            feed.calcUpperVolatility(uint(vol)).toUint120(),
-            volume.toUint120(),
-            volume.toUint120()
-        );
+        opt = OptionData(udlFeed, optType, strike.toUint120(), maturity.toUint32());
+        symbol = getOptionSymbol(opt);
     }
 
-    function findOrder(
+    function liquidateOptions(
         address owner,
-        string memory symbol
+        OptionData memory opt,
+        OptionToken tk,
+        bool isExpired,
+        uint iv
     )
         private
-        view
-        returns (OrderData memory)
+        returns (uint value)
     {
-        uint64 id = index[owner][symbol];
-        if (id > 0) {
-            return orders[id];
+        uint written = tk.writtenVolume(owner);
+        iv = iv.mul(written);
+
+        if (isExpired) {
+            value = liquidateAfterMaturity(owner, tk, written, iv);
+            emit LiquidateExpired(address(tk), msg.sender, owner, written);
+        } else {
+            require(written > 0, "invalid volume");
+            value = liquidateBeforeMaturity(owner, opt, tk, written, iv);
         }
     }
 
     function liquidateAfterMaturity(
-        OrderData memory ord,
-        string memory symbol,
-        address token,
+        address owner,
+        OptionToken tk,
+        uint written,
         uint iv
     )
         private
@@ -591,91 +520,133 @@ contract OptionsExchange is ManagedContract {
     {
         if (iv > 0) {
             value = iv.div(volumeBase);
-            creditProvider.processPayment(ord.owner, token, value);
+            creditProvider.processPayment(owner, address(tk), value);
         }
-    
-        removeOrder(symbol, ord.id);
+
+        if (written > 0) {
+            tk.burn(owner, written);
+        }
     }
 
     function liquidateBeforeMaturity(
-        OrderData memory ord,
-        string memory symbol,
-        address token,
+        address owner,
+        OptionData memory opt,
+        OptionToken tk,
+        uint written,
         uint iv
     )
         private
         returns (uint value)
     {
-        uint volume = calcLiquidationVolume(ord);
-        value = calcCollateral(ord.lowerVol, ord).add(iv)
-            .mul(volume.toUint120()).div(ord.written).div(volumeBase);
-        
-        orders[ord.id].written = uint(orders[ord.id].written).sub(volume).toUint120();
-        if (shouldRemove(ord.id)) {
-            removeOrder(symbol, ord.id);
+        FeedData memory fd = feeds[opt.udlFeed];
+
+        uint volume = calcLiquidationVolume(owner, opt, fd, written);
+        value = calcLiquidationValue(opt, fd.lowerVol, written, volume, iv)
+            .div(volumeBase);
+        creditProvider.processPayment(owner, address(tk), value);
+
+        if (volume > 0) {
+            tk.burn(owner, volume);
         }
 
-        creditProvider.processPayment(ord.owner, token, value);
+        emit LiquidateEarly(address(tk), msg.sender, owner, volume);
     }
 
-    function calcLiquidationVolume(OrderData memory ord) private view returns (uint volume) {
-        
-        uint bal = creditProvider.balanceOf(ord.owner);
-        uint collateral = calcCollateral(ord.owner);
-        require(collateral > bal, "unfit for liquidation");
+    function calcLiquidationVolume(
+        address owner,
+        OptionData memory opt,
+        FeedData memory fd,
+        uint written
+    )
+        private
+        view
+        returns (uint volume)
+    {    
+        uint bal = creditProvider.balanceOf(owner);
+        uint coll = calcCollateral(owner);
+        require(coll > bal, "unfit for liquidation");
 
-        volume = collateral.sub(bal).mul(volumeBase).mul(ord.written).div(
-            calcCollateral(uint(ord.upperVol).sub(uint(ord.lowerVol)), ord)
+        volume = coll.sub(bal).mul(volumeBase).mul(written).div(
+            calcCollateral(
+                uint(fd.upperVol).sub(uint(fd.lowerVol)),
+                written,
+                opt
+            )
         );
 
-        volume = MoreMath.min(volume, ord.written);
+        volume = MoreMath.min(volume, written);
     }
 
-    function shouldRemove(uint id) private view returns (bool) {
-
-        return orders[id].written == 0 && orders[id].holding == 0;
+    function calcLiquidationValue(
+        OptionData memory opt,
+        uint vol,
+        uint written,
+        uint volume,
+        uint iv
+    )
+        private
+        view
+        returns (uint value)
+    {    
+        value = calcCollateral(vol, written, opt).add(iv).mul(volume).div(written);
     }
-    
-    function removeOrder(string memory symbol, uint64 id) private {
+
+    function getFeedData(address udlFeed) private view returns (FeedData memory fd) {
         
-        address owner = orders[id].owner;
-        Arrays.removeItem(tokenIds[symbol], id);
-        Arrays.removeItem(book[owner], id);
-        delete index[owner][symbol];
-        delete orders[id];
+        UnderlyingFeed feed = UnderlyingFeed(udlFeed);
+
+        uint vol = feed.getDailyVolatility(settings.getVolatilityPeriod());
+
+        fd = FeedData(
+            feed.calcLowerVolatility(uint(vol)).toUint120(),
+            feed.calcUpperVolatility(uint(vol)).toUint120()
+        );
     }
 
-    function getOptionSymbol(OrderData memory ord) private view returns (string memory symbol) {
-        
+    function getOptionSymbol(OptionData memory opt) private view returns (string memory symbol) {    
+
         symbol = string(abi.encodePacked(
-            UnderlyingFeed(ord.udlFeed).symbol(),
+            UnderlyingFeed(opt.udlFeed).symbol(),
             "-",
             "E",
-            ord.option._type == OptionType.CALL ? "C" : "P",
+            opt._type == OptionType.CALL ? "C" : "P",
             "-",
-            MoreMath.toString(ord.option.strike),
+            MoreMath.toString(opt.strike),
             "-",
-            MoreMath.toString(ord.option.maturity)
+            MoreMath.toString(opt.maturity)
         ));
     }
-    
-    function ensureFunds(address owner) private view {
-        
-        require(
-            creditProvider.balanceOf(owner) >= calcCollateral(owner),
-            "insufficient collateral"
-        );
+
+    function calcCollateral(
+        OptionData memory opt,
+        uint volume
+    )
+        private
+        view
+        returns (uint)
+    {
+        FeedData memory fd = feeds[opt.udlFeed];
+        if (fd.lowerVol == 0 || fd.upperVol == 0) {
+            fd = getFeedData(opt.udlFeed);
+        }
+
+        int coll = calcIntrinsicValue(opt).mul(int(volume)).add(
+            int(calcCollateral(fd.upperVol, volume, opt))
+        ).div(int(volumeBase));
+
+        return coll > 0 ? uint(coll) : 0;
     }
     
-    function calcCollateral(uint vol, OrderData memory ord) private view returns (uint) {
+    function calcCollateral(uint vol, uint volume, OptionData memory opt) private view returns (uint) {
         
-        return (vol.mul(ord.written).mul(MoreMath.sqrt(daysToMaturity(ord)))).div(sqrtTimeBase);
+        return (vol.mul(volume).mul(
+            MoreMath.sqrt(daysToMaturity(opt)))
+        ).div(sqrtTimeBase);
     }
     
-    function calcIntrinsicValue(OrderData memory ord) private view returns (int value) {
+    function calcIntrinsicValue(OptionData memory opt) private view returns (int value) {
         
-        OptionData memory opt = ord.option;
-        int udlPrice = getUdlPrice(ord);
+        int udlPrice = getUdlPrice(opt);
         int strike = int(opt.strike);
 
         if (opt._type == OptionType.CALL) {
@@ -685,32 +656,27 @@ contract OptionsExchange is ManagedContract {
         }
     }
     
-    function isValid(OrderData memory ord) private pure returns (bool) {
+    function daysToMaturity(OptionData memory opt) private view returns (uint d) {
         
-        return ord.id > 0;
-    }
-    
-    function daysToMaturity(OrderData memory ord) private view returns (uint d) {
-        
-        uint _now = getUdlNow(ord);
-        if (ord.option.maturity > _now) {
-            d = (timeBase.mul(uint(ord.option.maturity).sub(uint(_now)))).div(1 days);
+        uint _now = getUdlNow(opt);
+        if (opt.maturity > _now) {
+            d = (timeBase.mul(uint(opt.maturity).sub(uint(_now)))).div(1 days);
         } else {
             d = 0;
         }
     }
 
-    function getUdlPrice(OrderData memory ord) private view returns (int answer) {
+    function getUdlPrice(OptionData memory opt) private view returns (int answer) {
 
-        if (ord.option.maturity > time.getNow()) {
-            (,answer) = UnderlyingFeed(ord.udlFeed).getLatestPrice();
+        if (opt.maturity > time.getNow()) {
+            (,answer) = UnderlyingFeed(opt.udlFeed).getLatestPrice();
         } else {
-            (,answer) = UnderlyingFeed(ord.udlFeed).getPrice(ord.option.maturity);
+            (,answer) = UnderlyingFeed(opt.udlFeed).getPrice(opt.maturity);
         }
     }
 
-    function getUdlNow(OrderData memory ord) private view returns (uint timestamp) {
+    function getUdlNow(OptionData memory opt) private view returns (uint timestamp) {
 
-        (timestamp,) = UnderlyingFeed(ord.udlFeed).getLatestPrice();
+        (timestamp,) = UnderlyingFeed(opt.udlFeed).getLatestPrice();
     }
 }
